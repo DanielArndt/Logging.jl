@@ -1,6 +1,6 @@
 module Logging
 
-import Base: show, info, warn
+import Base: show, info, warn, write, flush
 using Formatting
 
 export debug, info, warn, err, critical, log,
@@ -84,7 +84,7 @@ type SysLogIO <: IO
     )
 end
 
-write(syslog::SysLogIO, x) = write(syslog.buffer, x)
+write(syslog::SysLogIO, x...) = write(syslog.buffer, x...)
 function flush(syslog::SysLogIO)
     msg = takebuf_string(syslog.buffer)
     if len(msg) > 0
@@ -131,7 +131,10 @@ write_log(output::Base.TTY, color::Symbol, msg::AbstractString) = Base.print_wit
 function log(logger::Logger, color::Symbol, record::LogRecord)
     #old::  string(Libc.strftime("%d-%b %H:%M:%S",time()),":",level, ":",logger_name,":", msg...,"\n")
     logstring = format_msg(logger.formatter, record)
-    write_log(output, color, logstring)
+    for output in logger.output
+        @show logstring
+        write_log(output, color, logstring)
+    end
 end
 
 for (fn,lvl,clr) in ((:debug,    DEBUG,    :cyan),
@@ -143,7 +146,7 @@ for (fn,lvl,clr) in ((:debug,    DEBUG,    :cyan),
     @eval function $fn(logger::Logger, msg...)
         if $lvl <= logger.level
             record = DefaultLogRecord($lvl, msg...)
-            log(logger, $lvl, $(Expr(:quote, clr)), record)
+            log(logger, $(Expr(:quote, clr)), record)
         end
     end
 
