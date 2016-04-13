@@ -1,6 +1,7 @@
 module Logging
 
-import Base: show, info, warn
+import Base: show, info, warn, write, flush
+using Formatting
 
 export debug, info, warn, err, critical, log,
        @debug, @info, @warn, @err, @error, @critical, @log,
@@ -22,7 +23,42 @@ end
 
 @enum LogFacility LOG_KERN LOG_USER LOG_MAIL LOG_DAEMON LOG_AUTH LOG_SYSLOG LOG_LPR LOG_NEWS LOG_UUCP LOG_CRON LOG_AUTHPRIV LOG_LOCAL0=16 LOG_LOCAL1 LOG_LOCAL2 LOG_LOCAL3 LOG_LOCAL4 LOG_LOCAL5 LOG_LOCAL6 LOG_LOCAL7
 
-type SysLog
+abstract LogRecord
+abstract LogFormatter
+
+type DefaultLogRecord <: LogRecord
+    level::LogLevel
+    created::DateTime
+    msg::AbstractString
+
+    DefaultLogRecord(level, msg) = new(level, now(), msg)
+end
+
+type DefaultLogFormatter <: LogFormatter
+    fmt::AbstractString
+    date_fmt::AbstractString
+
+    DefaultLogFormatter(fmt="%(msg)", date_fmt="%Y-%m-%d %H:%M:%S") = new(fmt, date_fmt)
+end
+
+# How LogRecord fields are defined in LogFormatter.fmt strings: "%(field)"
+const _FORMATTER_REGEX = r"%\([^)]+\)"
+
+function format_msg(formatter, record)
+    function retrieve(s)
+        try
+            field = Symbol(s[3:end-1])
+            v = getfield(record, field)
+            return v
+        catch
+            return "<none>"
+        end
+    end
+    return replace(formatter.fmt, _FORMATTER_REGEX, retrieve)
+end
+
+type SysLogIO <: IO
+    buffer::IOBuffer
     socket::UDPSocket
     ip::IPv4
     port::UInt16
@@ -37,6 +73,7 @@ type SysLog
            machine::AbstractString=gethostname(),
            user::AbstractString=Base.source_path()==nothing ? "" : basename(Base.source_path()),
            maxlength::Int=1024) = new(
+        IOBuffer(),
         UDPSocket(),
         getaddrinfo(host),
         UInt16(port),
@@ -47,18 +84,28 @@ type SysLog
     )
 end
 
-LogOutput = Union{IO,SysLog}
+write(syslog::SysLogIO, x...) = write(syslog.buffer, x...)
+function flush(syslog::SysLogIO)
+    msg = takebuf_string(syslog.buffer)
+    if len(msg) > 0
+        send(syslog.socket,
+             syslog.ip,
+             syslog.port,
+             length(msg) > syslog.maxlength ? msg[1:syslog.maxlength] : msg)
+    end
+end
 
 type Logger
     name::AbstractString
     level::LogLevel
-    output::Array{LogOutput,1}
+    output::Array{IO,1}
     parent::Logger
+    formatter::LogFormatter
 
-    Logger(name::AbstractString, level::LogLevel, output::IO, parent::Logger) = new(name, level, [output], parent)
-    Logger(name::AbstractString, level::LogLevel, output::IO) = (x = new(); x.name = name; x.level=level; x.output=[output]; x.parent=x)
-    Logger{T<:LogOutput}(name::AbstractString, level::LogLevel, output::Array{T,1}, parent::Logger) = new(name, level, output, parent)
-    Logger{T<:LogOutput}(name::AbstractString, level::LogLevel, output::Array{T,1}) = (x = new(); x.name = name; x.level=level; x.output=output; x.parent=x)
+    Logger(name::AbstractString, level::LogLevel, output::IO, parent::Logger) = new(name, level, [output], parent, DefaultLogFormatter())
+    Logger(name::AbstractString, level::LogLevel, output::IO) = (x = new(); x.name = name; x.level=level; x.output=[output]; x.parent=x; x.formatter=DefaultLogFormatter(); return x)
+    Logger(name::AbstractString, level::LogLevel, output::Array{IO,1}, parent::Logger) = new(name, level, output, parent, DefaultLogFormatter())
+    Logger(name::AbstractString, level::LogLevel, output::Array{IO,1}) = (x = new(); x.name = name; x.level=level; x.output=output; x.parent=x; x.formatter=DefaultLogFormatter(); return x)
 end
 
 show(io::IO, logger::Logger) = print(io, "Logger(", join(Any[logger.name,
@@ -70,21 +117,24 @@ const _root = Logger("root", WARNING, STDERR)
 Logger(name::AbstractString;args...) = configure(Logger(name, WARNING, STDERR, _root); args...)
 Logger() = Logger("logger")
 
-write_log(syslog::SysLog, color::Symbol, msg::AbstractString) = send(syslog.socket, syslog.ip, syslog.port, length(msg) > syslog.maxlength ? msg[1:syslog.maxlength] : msg)
-write_log{T<:IO}(output::T, color::Symbol, msg::AbstractString) = (print(output, msg); flush(output))
+write_log{T<:IO}(output::T, color::Symbol, msg::AbstractString) = (write(output, msg); flush(output))
 write_log(output::Base.TTY, color::Symbol, msg::AbstractString) = Base.print_with_color(color, output, msg)
 
-function log(syslog::SysLog, level::LogLevel, color::Symbol, logger_name::AbstractString, msg...)
-    # syslog needs a timestamp in the form: YYYY-MM-DDTHH:MM:SS-TZ:TZ
-    t = time()
-    timestamp = string(Libc.strftime("%Y-%m-%dT%H:%M:%S",t), Libc.strftime("%z",t)[1:end-2], ":", Libc.strftime("%z",t)[end-1:end])
-    logstring = string("<", (UInt16(syslog.facility) << 3) + UInt16(level), ">1 ", timestamp, " ", syslog.machine, " ", syslog.user, " - - - ", level, ":", logger_name,":", msg...)
-    write_log(syslog, color, logstring)
-end
+#function log(syslog::SysLogIO, level::LogLevel, color::Symbol, logger_name::AbstractString, msg...)
+#    # syslog needs a timestamp in the form: YYYY-MM-DDTHH:MM:SS-TZ:TZ
+#    t = time()
+#    timestamp = string(Libc.strftime("%Y-%m-%dT%H:%M:%S",t), Libc.strftime("%z",t)[1:end-2], ":", Libc.strftime("%z",t)[end-1:end])
+#    logstring = string("<", (UInt16(syslog.facility) << 3) + UInt16(level), ">1 ", timestamp, " ", syslog.machine, " ", syslog.user, " - - - ", level, ":", logger_name,":", msg...)
+#    write_log(syslog, color, logstring)
+#end
 
-function log{T<:IO}(output::T, level::LogLevel, color::Symbol, logger_name::AbstractString, msg...)
-    logstring = string(Libc.strftime("%d-%b %H:%M:%S",time()),":",level, ":",logger_name,":", msg...,"\n")
-    write_log(output, color, logstring)
+function log(logger::Logger, color::Symbol, record::LogRecord)
+    #old::  string(Libc.strftime("%d-%b %H:%M:%S",time()),":",level, ":",logger_name,":", msg...,"\n")
+    logstring = format_msg(logger.formatter, record)
+    for output in logger.output
+        @show logstring
+        write_log(output, color, logstring)
+    end
 end
 
 for (fn,lvl,clr) in ((:debug,    DEBUG,    :cyan),
@@ -95,9 +145,8 @@ for (fn,lvl,clr) in ((:debug,    DEBUG,    :cyan),
 
     @eval function $fn(logger::Logger, msg...)
         if $lvl <= logger.level
-            for output in logger.output
-                log(output, $lvl, $(Expr(:quote, clr)), logger.name, msg...)
-            end
+            record = DefaultLogRecord($lvl, msg...)
+            log(logger, $(Expr(:quote, clr)), record)
         end
     end
 
@@ -106,6 +155,8 @@ for (fn,lvl,clr) in ((:debug,    DEBUG,    :cyan),
 end
 
 function configure(logger=_root; args...)
+    @show logger
+    @show args
     for (tag, val) in args
         if tag == :parent
             logger.parent = parent = val::Logger
